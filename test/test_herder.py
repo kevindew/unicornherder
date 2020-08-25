@@ -73,10 +73,11 @@ class TestHerder(object):
         assert_false(ret)
         popen_mock.return_value.terminate.assert_called_once_with()
 
-    @patch('unicornherder.herder.time.sleep')
+    @patch('unicornherder.herder.timeout')
     @patch('unicornherder.herder.psutil.Process')
     @patch('%s.open' % builtin_mod)
-    def test_configurable_overlap(self, open_mock, process_mock, sleep_mock):
+    def test_configurable_overlap(self, open_mock, process_mock, timeout_mock):
+        timeout_mock.side_effect = fake_timeout_fail
         h = Herder(overlap=17)
 
         # Set up an initial dummy master process for the herder to kill later
@@ -92,7 +93,33 @@ class TestHerder(object):
         h._handle_HUP(signal.SIGHUP, None)
 
         h._loop_inner()
-        sleep_mock.assert_any_call(17)
+        timeout_mock.assert_called_once_with(17)
+
+    @patch('unicornherder.herder.time.sleep')
+    @patch('unicornherder.herder.psutil.Process')
+    @patch('%s.open' % builtin_mod)
+    def test_waits_for_workers(self, open_mock, process_mock, sleep_mock):
+        open_mock.return_value.read.return_value = '123\n'
+        h = Herder()
+
+        # Set up an initial dummy master process for the herder to kill later
+        open_mock.return_value.read.return_value = '123\n'
+        process = MagicMock(pid=123)
+        process.children.return_value = ["forked process", "worker 1", "worker 2"]
+        h._loop_inner()
+
+        # Simulate a reloaded Unicorn
+        open_mock.return_value.read.return_value = '456\n'
+        process = MagicMock(pid=456)
+        # First call returns an empty list, the second returns 2 workers
+        process.children.side_effect = [[], ["worker 1", "worker 2"]]
+        process_mock.return_value = process
+
+        # Simulate SIGHUP, so the Herder thinks it's reloading
+        h._handle_HUP(signal.SIGHUP, None)
+
+        h._loop_inner()
+        sleep_mock.asset_any_call(1)
 
     @patch('unicornherder.herder.time.sleep')
     @patch('unicornherder.herder.psutil.Process')
@@ -154,15 +181,15 @@ class TestHerder(object):
         expected_calls = []
         assert_equal(proc1.mock_calls, expected_calls)
 
-    @patch('unicornherder.herder.time.sleep')
     @patch('unicornherder.herder.psutil.Process')
     @patch('%s.open' % builtin_mod)
-    def test_loop_reload_pidchange_signals(self, open_mock, process_mock,
-                                           sleep_mock):
+    def test_loop_reload_pidchange_signals(self, open_mock, process_mock):
         proc1 = MagicMock()
         proc2 = MagicMock()
         proc1.pid = 123
         proc2.pid = 456
+        proc1.children = MagicMock(return_value=[proc2, "worker"])
+        proc2.children = MagicMock(return_value=["worker 1"])
 
         h = Herder()
 
@@ -179,9 +206,8 @@ class TestHerder(object):
         ret = h._loop_inner()
         assert_equal(ret, True)
 
-        sleep_mock.assert_any_call(120)  # Check for the default overlap
-
         expected_calls = [call.send_signal(signal.SIGUSR2),
+                          call.children(),
                           call.send_signal(signal.SIGWINCH),
                           call.send_signal(signal.SIGQUIT)]
         assert_equal(proc1.mock_calls, expected_calls)
